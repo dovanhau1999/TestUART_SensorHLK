@@ -61,7 +61,7 @@ void Error_Handler(void);
 #define LED_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
-
+void UART1_IdleHandler(void);
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

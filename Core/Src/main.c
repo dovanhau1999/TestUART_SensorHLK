@@ -21,12 +21,34 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stm32f1xx_hal_gpio.h"
+#include "string.h"
+#include "stdbool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#define FRAME_SIZE     14
+#define DMA_BUF_SIZE   128     // tăng lên để tránh overflow
+#define RING_SIZE      256     // lớn hơn để không mất data
 
+UART_HandleTypeDef huart1;
+
+uint8_t dma_buf[DMA_BUF_SIZE];
+
+// Ring buffer
+uint8_t ring_buf[RING_SIZE];
+volatile uint16_t ring_head = 0;
+volatile uint16_t ring_tail = 0;
+
+// Double buffer tránh race condition
+uint8_t frame_buf[FRAME_SIZE];
+uint8_t frame_shadow[FRAME_SIZE];
+
+volatile bool frame_ready = false;
+volatile bool flag_turnon = false;
+
+static uint16_t old_pos = 0;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -50,6 +72,7 @@ TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 
@@ -58,6 +81,7 @@ UART_HandleTypeDef huart2;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
@@ -70,7 +94,101 @@ static void MX_TIM4_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Ring_Push(uint8_t data)
+{
+    uint16_t next = (ring_head + 1) % RING_SIZE;
 
+    if (next == ring_tail)
+    {
+        // FULL → bỏ byte cũ (anti overflow)
+        ring_tail = (ring_tail + 1) % RING_SIZE;
+    }
+
+    ring_buf[ring_head] = data;
+    ring_head = next;
+}
+
+static int Ring_Pop(uint8_t *data)
+{
+    if (ring_head == ring_tail) return 0;
+
+    *data = ring_buf[ring_tail];
+    ring_tail = (ring_tail + 1) % RING_SIZE;
+    return 1;
+}
+
+void UART1_DMA_Start(void)
+{
+    HAL_UART_Receive_DMA(&huart1, dma_buf, DMA_BUF_SIZE);
+    __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+}
+
+void Process_RingBuffer(void)
+{
+    static uint8_t window[FRAME_SIZE];
+    static uint8_t count = 0;
+
+    uint8_t byte;
+
+    while (Ring_Pop(&byte))
+    {
+        // shift window
+        for (int i = 0; i < FRAME_SIZE - 1; i++)
+            window[i] = window[i + 1];
+
+        window[FRAME_SIZE - 1] = byte;
+
+        if (count < FRAME_SIZE)
+        {
+            count++;
+            continue;
+        }
+
+        // Check header
+        if (window[0] == 0x33 &&
+            window[1] == 0x01 &&
+            window[2] == 0x5F &&
+            window[3] == 0x00 &&
+            window[4] == 0x0F)
+        {
+            // copy đảo vào shadow buffer
+            for (int i = 0; i < FRAME_SIZE; i++)
+            {
+                frame_shadow[FRAME_SIZE - 1 - i] = window[i];
+            }
+
+            // critical section (tránh lỗi khi main đọc)
+            __disable_irq();
+            memcpy(frame_buf, frame_shadow, FRAME_SIZE);
+            frame_ready = true;
+            __enable_irq();
+        }
+    }
+}
+
+void UART1_IdleHandler(void)
+{
+    uint16_t pos = DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+
+    if (pos != old_pos)
+    {
+        if (pos > old_pos)
+        {
+            for (uint16_t i = old_pos; i < pos; i++)
+                Ring_Push(dma_buf[i]);
+        }
+        else
+        {
+            for (uint16_t i = old_pos; i < DMA_BUF_SIZE; i++)
+                Ring_Push(dma_buf[i]);
+
+            for (uint16_t i = 0; i < pos; i++)
+                Ring_Push(dma_buf[i]);
+        }
+
+        old_pos = pos;
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -102,6 +220,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
@@ -116,9 +235,31 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    HAL_IWDG_Refresh(&hiwdg);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+     Process_RingBuffer();
+
+    if (frame_ready)
+    {
+        frame_ready = false;
+
+        uint8_t byte_LightOutside = frame_buf[8];
+        uint8_t byte_motion       = frame_buf[11];
+
+        if (byte_LightOutside > 70)
+        {
+          if (byte_motion > 150)
+          {
+            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          }
+        }else 
+        {
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+        }
+
+    }
   }
   /* USER CODE END 3 */
 }
@@ -386,6 +527,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 
 }
 
